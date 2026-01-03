@@ -1,116 +1,148 @@
-# Author: Aditya Sharma
-# Purpose: AD User Provisioning Automation
-# Context: Enterprise lab environment
+<#
+.Author
+    Aditya Sharma
 
-$CsvPath = "File Path where CSV is stored"
-$users = Import-Csv -Path $CsvPath -ErrorAction Stop
-$LogFolder = "C:\Temp"
+.Purpose
+    Automated Active Directory user provisioning with validation, logging,
+    audit traceability, and enterprise-ready execution controls.
 
+.Context
+    Designed and tested in an enterprise-style lab environment to simulate
+    real-world IAM and infrastructure operations.
 
+.Features
+    - Bulk user creation from CSV
+    - Pre-validation and duplicate detection
+    - Secure random password generation
+    - Centralized logging and transcript capture
+    - Optional group membership assignment
+    - Safe execution using -WhatIf support
+#>
 
-# ensure log folder exists
-if (-not (Test-Path -Path $LogFolder)) { New-Item -ItemType Directory -Path $LogFolder -Force | Out-Null }
+[CmdletBinding(SupportsShouldProcess)]
+param (
+    [Parameter(Mandatory)]
+    [string]$CsvPath,
 
+    [string]$LogFolder = "C:\Temp",
 
-$LogFile = Join-Path $LogFolder ("ADUserCreation_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    [string]$UPNSuffix = "zy.va.atcsg.net"
+)
+
+# -----------------------------
+# Pre-flight checks
+# -----------------------------
+Import-Module ActiveDirectory -ErrorAction Stop
+
+if (-not (Test-Path $CsvPath)) {
+    throw "CSV file not found at path: $CsvPath"
+}
+
+if (-not (Test-Path $LogFolder)) {
+    New-Item -ItemType Directory -Path $LogFolder -Force | Out-Null
+}
+
+# -----------------------------
+# Logging & Transcript
+# -----------------------------
+$TimeStamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$LogFile   = Join-Path $LogFolder "ADUserCreation_$TimeStamp.log"
+$TranscriptFile = Join-Path $LogFolder "ADUserCreation_$TimeStamp.transcript.txt"
+
+Start-Transcript -Path $TranscriptFile -Append | Out-Null
 
 function Write-Log {
-    param([string]$Message, [string]$Level = "INFO")
+    param(
+        [string]$Message,
+        [ValidateSet("INFO","WARN","ERROR")]
+        [string]$Level = "INFO"
+    )
+
     $line = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
     $line | Out-File -FilePath $LogFile -Append -Encoding UTF8
     Write-Host $line
 }
 
-# Start
-Write-Log "Starting AD bulk create. CSV: $CsvPath"
+Write-Log "Starting AD bulk user provisioning"
+Write-Log "CSV Source: $CsvPath"
+
+# -----------------------------
+# Import CSV
+# -----------------------------
+$users = Import-Csv -Path $CsvPath -ErrorAction Stop
 
 foreach ($u in $users) {
-    # Normalize values (trim)
-    $sam = ($u.samaccountname -as [string]).Trim()
-    $first = ($u.firstname -as [string]).Trim()
-    $last = ($u.lastname -as [string]).Trim()
-    $display = ($u.displayname -as [string]).Trim()
-    $ou = ($u.ou -as [string]).Trim()
-    $group = ($u.group -as [string]).Trim()
 
-    if ([string]::IsNullOrWhiteSpace($sam) -or [string]::IsNullOrWhiteSpace($display) -or [string]::IsNullOrWhiteSpace($ou)) {
-        Write-Log "Missing required fields for SAM='$sam' - skipping row." "WARN"
+    $sam     = ($u.samaccountname  -as [string]).Trim()
+    $first   = ($u.firstname       -as [string]).Trim()
+    $last    = ($u.lastname        -as [string]).Trim()
+    $display = ($u.displayname     -as [string]).Trim()
+    $ou      = ($u.ou              -as [string]).Trim()
+    $group   = ($u.group           -as [string]).Trim()
+
+    if ([string]::IsNullOrWhiteSpace($sam) -or
+        [string]::IsNullOrWhiteSpace($display) -or
+        [string]::IsNullOrWhiteSpace($ou)) {
+
+        Write-Log "Missing mandatory attributes for SAM='$sam'. Skipping row." "WARN"
         continue
     }
 
     Write-Log "Processing user: $sam"
 
-    # Check if user already exists — robust form (no duplicate ErrorAction params)
-    $exists = Get-ADUser -Filter "SamAccountName -eq '$sam'" -ErrorAction SilentlyContinue
-    if ($exists) {
+    # Duplicate check
+    if (Get-ADUser -Filter "SamAccountName -eq '$sam'" -ErrorAction SilentlyContinue) {
         Write-Log "User $sam already exists. Skipping creation." "WARN"
         continue
     }
 
-    # Generate a strong random temporary password (you can change policy here)
+    # Generate temporary password
     $tempPasswordPlain = -join ((33..126) | Get-Random -Count 14 | ForEach-Object {[char]$_})
-    $securePassword = ConvertTo-SecureString -String $tempPasswordPlain -AsPlainText -Force
+    $securePassword = ConvertTo-SecureString $tempPasswordPlain -AsPlainText -Force
 
     try {
-        # Create user
-        $newUserParams = @{
-            Name = $display
-            GivenName = $first
-            Surname = $last
-            SamAccountName = $sam
-            DisplayName = $display
-            Path = $ou
-            AccountPassword = $securePassword
-            ChangePasswordAtLogon = $true
-            Enabled = $true
-            UserPrincipalName = "$sam@zy.va.atcsg.net"
-        }
+        if ($PSCmdlet.ShouldProcess($sam, "Create AD User")) {
 
-        New-ADUser @newUserParams -ErrorAction Stop
-        Write-Log "Created user $sam in OU $ou."
+            New-ADUser `
+                -Name $display `
+                -GivenName $first `
+                -Surname $last `
+                -SamAccountName $sam `
+                -DisplayName $display `
+                -UserPrincipalName "$sam@$UPNSuffix" `
+                -Path $ou `
+                -AccountPassword $securePassword `
+                -ChangePasswordAtLogon $true `
+                -Enabled $true `
+                -ErrorAction Stop
 
-        # Ensure mail attribute is cleared (explicitly blank)
-        # Set-ADUser -Identity $sam -Clear mail -ErrorAction Stop
+            Write-Log "User $sam created successfully in OU $ou"
 
-        # Set extensionAttribute14 = "EntraSYNC" for Syncing user on cloud
-        # Use -Replace so it sets even if attribute exists
-        Set-ADUser -Identity $sam -Replace @{extensionAttribute14='EntraSYNC'} -ErrorAction Stop
+            # Tag user for cloud sync awareness
+            Set-ADUser -Identity $sam -Replace @{ extensionAttribute14 = "EntraSYNC" } -ErrorAction Stop
 
-        # Export temp passwords to CSV
-        $PasswordExportFile = "C:\Temp\CreatedUserPasswords.csv"
-        if (-not (Test-Path $PasswordExportFile)) {
-            "samaccountname,temppassword" | Out-File $PasswordExportFile -Encoding UTF8
-        }
+            # Password export (controlled file)
+            $PasswordExportFile = Join-Path $LogFolder "CreatedUserPasswords.csv"
+            if (-not (Test-Path $PasswordExportFile)) {
+                "samaccountname,temppassword" | Out-File $PasswordExportFile -Encoding UTF8
+            }
 
-        # Append quoted line to avoid comma issues
-        $escapedSam = $sam.Replace('"','""')
-        $escapedPwd = $tempPasswordPlain.Replace('"','""')
-        $line = '"' + $escapedSam + '","' + $escapedPwd + '"'
-        Add-Content -Path $PasswordExportFile -Value $line -Encoding UTF8
+            Add-Content -Path $PasswordExportFile -Value "`"$sam`",`"$tempPasswordPlain`"" -Encoding UTF8
 
-        # Add to group if provided
-        if (-not [string]::IsNullOrWhiteSpace($group)) {
-            try {
-                $g = Get-ADGroup -Identity $group -ErrorAction Stop
-                Add-ADGroupMember -Identity $g -Members $sam -ErrorAction Stop
-                Write-Log "Added $sam to group '$group'."
-            } catch {
-                # if group not found by identity, try searching by name
-                try {
-                    $g2 = Get-ADGroup -Filter { Name -eq $group } -ErrorAction Stop
-                    Add-ADGroupMember -Identity $g2 -Members $sam -ErrorAction Stop
-                    Write-Log "Added $sam to group (found by name) '$($g2.Name)'."
-                } catch {
-                    Write-Log "Could not add $sam to group '$group' : $_" "ERROR"
-                }
+            # Optional group membership
+            if ($group) {
+                Add-ADGroupMember -Identity $group -Members $sam -ErrorAction Stop
+                Write-Log "Added $sam to group '$group'"
             }
         }
-
-    } catch {
-        Write-Log "Failed to create user $sam : $_" "ERROR"
-        continue
+    }
+    catch {
+        Write-Log "Failed processing user $sam : $_" "ERROR"
     }
 }
 
-Write-Log "Processing completed. Log saved to $LogFile"
-Write-Log "Passwords exported to C:\Temp\CreatedUserPasswords.csv (protect this file!)."
+Write-Log "AD user provisioning completed"
+Write-Log "Log file: $LogFile"
+Write-Log "Transcript: $TranscriptFile"
+
+Stop-Transcript | Out-Null
