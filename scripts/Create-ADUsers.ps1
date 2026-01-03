@@ -1,3 +1,7 @@
+# Author: Aditya Sharma
+# Purpose: AD User Provisioning Automation
+# Context: Enterprise lab environment
+
 $CsvPath = "File Path where CSV is stored"
 $users = Import-Csv -Path $CsvPath -ErrorAction Stop
 $LogFolder = "C:\Temp"
