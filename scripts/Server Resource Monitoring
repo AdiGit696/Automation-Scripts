@@ -1,0 +1,203 @@
+# Author: Aditya Sharma
+# Purpose: Monitoring of Resources connected to a Server
+# Context: Enterprise lab environment
+
+
+Server Resource Monitoring Forest:
+
+Import-Module ActiveDirectory
+
+# Get all domains in the forest
+$forest = Get-ADForest
+$allServers = @()
+
+foreach ($domain in $forest.Domains) {
+
+    Write-Host "Querying domain: $domain"
+
+    $servers = Get-ADComputer `
+        -Server $domain `
+        -Filter {
+            Enabled -eq $true -and OperatingSystem -like "*Server*"
+        } `
+        -Properties OperatingSystem, DNSHostName |
+        Select-Object -ExpandProperty DNSHostName
+
+    $allServers += $servers
+}
+
+$results = foreach ($c in $allServers) {
+
+    try {
+        # System Info
+        $cs = Get-WmiObject Win32_ComputerSystem -ComputerName $c
+        $ramTotalGB = [math]::Round($cs.TotalPhysicalMemory / 1GB, 0)
+
+        $os = Get-WmiObject Win32_OperatingSystem -ComputerName $c
+
+        $cpu = Get-WmiObject Win32_Processor -ComputerName $c |
+               Measure-Object LoadPercentage -Average |
+               Select-Object -ExpandProperty Average
+
+        $ramUsedPct = [math]::Round(
+            ((($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) /
+              $os.TotalVisibleMemorySize) * 100), 2
+        )
+
+        # Disk Info
+        $disks = Get-WmiObject Win32_LogicalDisk -ComputerName $c -Filter "DriveType=3"
+
+        foreach ($d in $disks) {
+
+            $total = [math]::Round($d.Size / 1GB, 2)
+            $free  = [math]::Round($d.FreeSpace / 1GB, 2)
+            $used  = [math]::Round($total - $free, 2)
+            $freePct = if ($total -gt 0) {
+                [math]::Round((($free / $total) * 100), 2)
+            } else { 0 }
+
+            if ($freePct -lt 5) {
+    $alert = "CRITICAL"
+}
+elseif ($freePct -lt 10) {
+    $alert = "LOW"
+}
+else {
+    $alert = "OK"
+}
+
+
+            [PSCustomObject]@{
+                "Server Name" = $c
+                Drive      = $d.DeviceID
+                "Disk Total Space (GB)"    = $total
+                "Disk Used Space (GB)"     = $used
+                "Disk Free Space (GB)"     = $free
+                "Disk Free Space (%)"    = $freePct
+                "Disk Alert"  = $alert
+                "Total RAM (GB)"     = $ramTotalGB
+                "Memory Utilization (%)"   = $ramUsedPct
+                "CPU Utilization (%)"   = $cpu
+            }
+        }
+    }
+    catch {
+        Write-Warning "Failed collecting data from $c"
+    }
+}
+
+
+# Build HTML Report
+
+$style = @"
+<style>
+body { font-family: Segoe UI; font-size: 12px; }
+h2 { color: #2F5496; }
+table { border-collapse: collapse; width: 100%; }
+th, td { border: 1px solid #d0d0d0; padding: 6px; text-align: center; }
+th { background-color: #4472C4; color: white; }
+
+.OK { background-color: #C6EFCE; }        /* Green */
+.LOW { background-color: #FFC7CE; }       /* Light Red */
+.CRITICAL { background-color: #FF0000; color: white; font-weight: bold; } /* Red */
+</style>
+"@
+
+
+$htmlBody = $results | ConvertTo-Html `
+    -Head $style `
+    -Title "Server Resource Monitoring Report" `    
+    -Property @(
+        "Server Name",
+        'Drive',
+        "Disk Total Space (GB)",
+        "Disk Used Space (GB)",
+        "Disk Free Space (GB)",
+        "Disk Free Space (%)",
+        "Disk Alert",
+        "Total RAM (GB)",
+        "Memory Utilization (%)",
+        "CPU Utilization (%)"
+    )
+
+# Add color formatting for Disk Alert
+$htmlBody = $htmlBody -replace "<td>OK</td>", "<td class='OK'>OK</td>"
+$htmlBody = $htmlBody -replace "<td>LOW</td>", "<td class='LOW'>LOW</td>"
+$htmlBody = $htmlBody -replace "<td>CRITICAL</td>", "<td class='CRITICAL'>CRITICAL</td>"
+
+
+# Save HTML Report to File
+
+$reportPath = $reportPath = "C:\Temp\Server Resource Monitoring Report_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
+$htmlBody | Out-File -FilePath $reportPath -Encoding UTF8
+
+# Location of script
+
+$scriptServer = $env:COMPUTERNAME
+$scriptPath   = $MyInvocation.MyCommand.Path
+$executionTime = Get-Date -Format "dd-MMM-yyyy HH:mm:ss"
+
+
+# Mail Body
+
+$mailBody = @"
+<html>
+<body>
+
+<p>Hello All,</p>
+
+<p>Please find below <b>Server Resource Monitoring report</b>:</p>
+
+<p><b>Alert Severity Criteria:</b></p>
+<ul>
+<li><b>CRITICAL</b> - Disk free space less than <b>5%</b></li>
+<li><b>LOW</b> - Disk free space less than <b>10%</b></li>
+<li><b>OK</b> - Disk free space greater than or equal to <b>10%</b></li>
+</ul>
+
+<p><b>Script Execution Details:</b></p>
+<table border="1" cellpadding="5" cellspacing="0">
+    <tr>
+        <td><b>Executed From Server</b></td>
+        <td>$scriptServer</td>
+    </tr>
+    <tr>
+        <td><b>Script Location</b></td>
+        <td>$scriptPath</td>
+    </tr>
+    <tr>
+        <td><b>Execution Time</b></td>
+        <td>$executionTime</td>
+    </tr>
+</table>
+
+<br/>
+
+$htmlBody
+
+<br/><br/>
+
+<p>
+Thanks & Regards,<br/>
+<b>Team Name</b>
+</p>
+
+</body>
+</html>
+"@
+
+
+# Send Email
+
+$mailParams = @{
+    SmtpServer = 'Enterprise Server'
+    To         = "Receipients Email IDs"
+    From       = "Sender Email ID"
+    Subject    = "Server Resource Monitoring Report - $(Get-Date -Format 'dd-MMM-yyyy')"
+    Body       = $mailBody
+    BodyAsHtml = $true
+}
+
+Send-MailMessage @mailParams
+
+Write-Host "HTML inventory report generated and sent via email."
