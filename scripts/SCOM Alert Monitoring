@@ -1,0 +1,168 @@
+# Author: Aditya Sharma
+# Purpose: SCOM Alert Monitoring
+# Context: Enterprise lab environment
+
+
+SCOM :
+
+
+Import-Module OperationsManager
+
+$runServer  = $env:COMPUTERNAME
+$runTime    = Get-Date -Format "dd-MMM-yyyy HH:mm:ss"
+$scriptPath = if ($PSCommandPath) { $PSCommandPath } else { "Run interactively (no script file)" }
+
+# -------------------------
+# SCOM Data
+# -------------------------
+$windowsClass  = Get-SCOMClass -Name "Microsoft.Windows.Computer"
+$servers       = Get-SCOMClassInstance -Class $windowsClass
+$agents        = Get-SCOMAgent
+$mmObjects     = Get-SCOMMaintenanceMode
+$allAlerts     = Get-SCOMAlert
+
+# -------------------------
+# HTML Header
+# -------------------------
+$html = @"
+<html>
+<head>
+<style>
+body { font-family: Segoe UI; background-color: #f4f4f4; }
+table { border-collapse: collapse; width: 100%; background-color: white; }
+th { background-color: #2f5597; color: white; padding: 8px; }
+td { border: 1px solid #ccc; padding: 6px; }
+</style>
+</head>
+<body>
+
+<p>Hello all,</p>
+
+<p>Please find below <b>SCOM Server Health Report</b>.</p>
+
+<p>
+<b>Executed From Server:</b> $runServer<br/>
+<b>Script Location:</b> $scriptPath<br/>
+<b>Execution Time:</b> $runTime
+</p>
+
+<p>
+<b>Severity Legend:</b>
+<span style="background:#ffc7ce;padding:4px;">Critical</span>
+<span style="background:#ffeb9c;padding:4px;">Warning</span>
+<span style="background:#c6efce;padding:4px;">No Severity</span>
+</p>
+
+<table>
+<tr>
+<th>ServerName</th>
+<th>HealthState</th>
+<th>AgentHealth</th>
+<th>MaintenanceMode</th>
+<th>AlertName</th>
+<th>Severity</th>
+<th>AlertAge</th>
+<th>TimeRaised</th>
+<th>Description</th>
+</tr>
+"@
+
+# -------------------------
+# Build Table Rows (FULL CONTROL)
+# -------------------------
+foreach ($server in $servers) {
+
+    if (-not $server.IsAvailable) { continue }
+
+    $short = $server.DisplayName.Split('.')[0]
+
+    $agent = $agents | Where-Object { $_.ComputerName -ieq $short }
+    $agentHealth = if ($agent) { $agent.HealthState } else { "Not Found" }
+
+    $mm = if ($mmObjects | Where-Object {
+        $_.MonitoringObjectDisplayName -eq $server.DisplayName
+    }) { "Yes" } else { "No" }
+
+    $alerts = $allAlerts | Where-Object {
+        $_.MonitoringObjectPath -like "*$($server.DisplayName)*" -and
+        $_.ResolutionState -eq 0
+    }
+
+    if (-not $alerts) {
+        $html += @"
+<tr>
+<td>$($server.DisplayName)</td>
+<td>$($server.HealthState)</td>
+<td>$agentHealth</td>
+<td>$mm</td>
+<td>No Active Alerts</td>
+<td bgcolor="#c6efce">No Severity</td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+"@
+        continue
+    }
+
+    foreach ($alert in $alerts) {
+
+        $ts = New-TimeSpan -Start $alert.TimeRaised -End (Get-Date)
+        $age = "{0}d {1}h {2}m {3}s" -f $ts.Days,$ts.Hours,$ts.Minutes,$ts.Seconds
+
+        $sevColor = switch -Regex ($alert.Severity) {
+            "Critical|Error" { "#ffc7ce" }
+            "Warning"        { "#ffeb9c" }
+            default          { "#c6efce" }
+        }
+
+        $html += @"
+<tr>
+<td>$($server.DisplayName)</td>
+<td>$($server.HealthState)</td>
+<td>$agentHealth</td>
+<td>$mm</td>
+<td>$($alert.Name)</td>
+<td bgcolor="$sevColor">$($alert.Severity)</td>
+<td>$age</td>
+<td>$($alert.TimeRaised)</td>
+<td>$($alert.Description)</td>
+</tr>
+"@
+    }
+}
+
+# -------------------------
+# Close HTML
+# -------------------------
+$html += @"
+</table>
+<br/><br/>
+<p>
+Thanks & Regards,<br/>
+<b>Team Name</b>
+</p>
+</body>
+</html>
+"@
+
+
+# -------------------------
+# Save / Send
+# -------------------------
+$reportPath = "D:\SCOM_Infra_Health_Report-15.html"
+$html | Out-File $reportPath -Encoding UTF8
+
+$mailParams = @{
+    SmtpServer = 'Enterprise Server'
+    To         = "Receipient's Email IDs"
+    From       = "Sender Email ID"
+    Subject    = "SCOM Server Health Report - $(Get-Date -Format 'dd-MMM-yyyy')"
+    Body       = $html
+    BodyAsHtml = $true
+}
+
+Send-MailMessage @mailParams
+
+Write-Host "Report generated:"
+Write-Host $reportPath
